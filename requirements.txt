@@ -1,0 +1,4 @@
+# Runtime dependencies: none. This file is for build tooling only.
+build>=0.10.0
+setuptools>=40.8.0
+wheel>=0.37.0
