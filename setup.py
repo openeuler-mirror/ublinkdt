@@ -35,7 +35,7 @@ class build_py(_build_py):
 
     def run(self):
         super().run()
-        target = Path(self.build_lib) / 'src' / 'otpd' / '_runtime_mode.py'
+        target = Path(self.build_lib) / 'ublinkdt' / 'otpd' / '_runtime_mode.py'
         target.write_text(
             'DEBUG_BUILD = {}\n'.format('True' if _is_debug_build() else 'False'),
             encoding='utf-8',
@@ -50,7 +50,12 @@ setup(
     version='1.0.0',
     description='UBLink-DT (Unified Bus Link Diagnostic Tool)',
     author='liusiyu60@huawei.com',
-    packages=find_packages(exclude=['tests', 'tests.*']),
+    package_dir={"ublinkdt": "src"},
+    packages=[
+        "ublinkdt",
+        "ublinkdt.otpd",
+        "ublinkdt.utils"
+    ],
     install_requires=[],
     extras_require={
         'debug': [
@@ -63,8 +68,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'ublinkdt=src.otpd.cli:main',
+            'ublinkdt=ublinkdt.otpd.cli:main',
         ],
     },
     python_requires='>=3.7',
 )
+
