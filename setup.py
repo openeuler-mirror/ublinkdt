@@ -52,6 +52,7 @@ setup(
     author='liusiyu60@huawei.com',
     package_dir={"ublinkdt": "src"},
     packages=[
+        "ublinkdt",
         "ublinkdt.otpd",
         "ublinkdt.utils"
     ],
