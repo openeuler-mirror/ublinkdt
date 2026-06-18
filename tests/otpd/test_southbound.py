@@ -762,3 +762,722 @@ class TestOpticalDomParser:
         assert result["tx_lol_flag"] == 0
 
 
+class TestCompositeSouthbound:
+    """Test baseline + command overlay southbound."""
+
+    def setup_method(self):
+        CompositeSouthbound._data_cache.clear()
+
+    class _BaselineSouthbound(SouthboundInterface):
+        def get_port_data(self, port_id: int, chip_id: int, die_id: int = 0, use_cache: bool = True):
+            return (
+                PortInfo(
+                    port_id=port_id,
+                    chip_id=chip_id,
+                    port_snrlane=[1.0] * 4,
+                    cw_fec_cnt=10,
+                    cw_uncorrect_cnt=1,
+                    cw_total_cnt=1010,
+                ),
+                OpticalModuleInfo(
+                    port_id=port_id,
+                    chip_id=chip_id,
+                    optical_sn="BASELINE-SN",
+                    optical_vendor="BASELINE-VENDOR",
+                    temp=30,
+                    interface_code=3,
+                ),
+            )
+
+    def test_command_fields_override_baseline_fields(self):
+        """Command overlay fields override baseline, other fields keep baseline."""
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="dummy",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["cw_fec_cnt", "temp"],
+        ))
+        overlay.get_field_data_with_failures = lambda port_id, chip_id, die_id=0, required_fields=None: (
+            {"cw_fec_cnt": 20, "temp": 40}, []
+        )
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+            calculators=[calculate_derived_fields],
+        )
+
+        result = sb.get_port_data(0, 0)
+        assert result is not None
+        port_info, optical_info = result
+        assert port_info.cw_fec_cnt == 20
+        assert port_info.port_snrlane == [1.0] * 4  # baseline preserved
+        assert optical_info.temp == 40
+        assert optical_info.optical_sn == "BASELINE-SN"  # baseline preserved
+
+    def test_optical_absent_does_not_leak_baseline_fields(self):
+        """Optical command absent output must zero command-covered baseline fields."""
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="optical",
+            command=["echo"],
+            parser=parse_optical_dom,
+            fields=[
+                "optical_sn", "optical_vendor", "optical_state",
+                "optical_type_name", "lane_count", "temp", "vcc",
+                "tx_power", "rx_power", "tx_bias", "host_snr", "media_snr",
+                "tx_los_flag", "rx_los_flag", "tx_lol_flag", "rx_lol_flag",
+            ],
+        ))
+        overlay.get_field_data_with_failures = lambda port_id, chip_id, die_id=0, required_fields=None: (
+            parse_optical_dom("no optical module present on port 0"), []
+        )
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+        )
+
+        result = sb.get_port_data(0, 0)
+        assert result is not None
+        _, optical_info = result
+        assert optical_info.optical_sn == ""
+        assert optical_info.optical_vendor == ""
+        assert optical_info.optical_type_name == ""
+        assert optical_info.lane_count == 0
+        assert optical_info.temp == 0
+        assert optical_info.tx_power == [0.0] * 16
+
+    def test_all_commands_fail_returns_none_production_mode(self, caplog, stub_mode_off):
+        """When bound overlay commands fail in production mode, return None."""
+        overlay = CommandBasedSouthbound()
+        failed_entry = CommandEntry(
+            name="dummy",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["cw_fec_cnt", "cw_uncorrect_cnt"],
+        )
+        overlay.register_command(failed_entry)
+        overlay.get_field_data_with_failures = lambda port_id, chip_id, die_id=0, required_fields=None: (
+            {}, [failed_entry]
+        )
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+            calculators=[calculate_derived_fields],
+        )
+
+        token = set_query_context("ublinkdt -m otpd -p 0 -c 0 -d 0 --stat")
+        try:
+            with caplog.at_level("WARNING", logger="src.otpd.southbound"):
+                result = sb.get_port_data(0, 0)
+        finally:
+            reset_query_context(token)
+        assert result is None
+        assert "Southbound fields missing" in caplog.text
+        assert "ublinkdt_command='ublinkdt -m otpd -p 0 -c 0 -d 0 --stat'" in caplog.text
+        assert "target=port:0,chip:0,die:0" in caplog.text
+        assert "southbound_command='dummy'" in caplog.text
+        assert "command='echo'" in caplog.text
+        assert "missing_fields=['cw_fec_cnt', 'cw_uncorrect_cnt']" in caplog.text
+
+    def test_all_commands_fail_falls_back_to_zeros_stub_mode(self, caplog, stub_mode_on):
+        """When bound overlay commands fail in stub mode, fall back to zero baseline."""
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="dummy",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["cw_fec_cnt", "cw_uncorrect_cnt"],
+        ))
+        overlay.get_field_data_with_failures = lambda port_id, chip_id, die_id=0, required_fields=None: ({}, [])
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+            calculators=[calculate_derived_fields],
+        )
+
+        with caplog.at_level("WARNING", logger="src.otpd.southbound"):
+            result = sb.get_port_data(0, 0)
+        assert result is not None
+        port_info, _ = result
+        assert port_info.cw_fec_cnt == 0
+        assert port_info.cw_uncorrect_cnt == 0
+        assert not [record for record in caplog.records if record.name == "src.otpd.southbound"]
+
+    def test_string_field_all_commands_fail_returns_none_production_mode(self, caplog, stub_mode_off):
+        """When bound overlay commands fail in production mode, return None even for string fields."""
+        overlay = CommandBasedSouthbound()
+        failed_entry = CommandEntry(
+            name="port_link",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["link_status"],
+        )
+        overlay.register_command(failed_entry)
+        overlay.get_field_data_with_failures = lambda pid, cid, did=0, required_fields=None: (
+            {}, [failed_entry]
+        )
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+        )
+        with caplog.at_level("WARNING", logger="src.otpd.southbound"):
+            result = sb.get_port_data(0, 0)
+        assert result is None
+        assert "Southbound fields missing" in caplog.text
+        assert "southbound_command='port_link'" in caplog.text
+        assert "missing_fields=['link_status']" in caplog.text
+
+    def test_link_status_all_commands_fail_uses_mock_stub_mode(self, caplog, stub_mode_on):
+        """When link status fails in stub mode, return mock status instead of zero/empty."""
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="port_link",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["link_status"],
+        ))
+        overlay.get_field_data_with_failures = lambda pid, cid, did=0, required_fields=None: ({}, [])
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+        )
+        with caplog.at_level("WARNING", logger="src.otpd.southbound"):
+            result = sb.get_port_data(0, 0)
+        assert result is not None
+        port_info, _ = result
+        assert "link status info:" in port_info.link_status
+        assert "current_time" in port_info.link_status
+        assert "link_up_count      : 2" in port_info.link_status
+        assert "link_down_count    : 1" in port_info.link_status
+        assert "Mon Oct 23 10:30:15 2023  LINK UP" in port_info.link_status
+        assert "Mon Oct 23 10:25:10 2023  LINK DOWN" in port_info.link_status
+        assert not [record for record in caplog.records if record.name == "src.otpd.southbound"]
+
+    def test_link_status_mock_stub_mode_uses_static_counts(self, stub_mode_on):
+        """Link status stub keeps stable counts independent of the chip."""
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="port_link",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["link_status"],
+        ))
+        overlay.get_field_data_with_failures = lambda pid, cid, did=0, required_fields=None: ({}, [])
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+        )
+
+        port_info, _ = sb.get_port_data(0, 1, required_fields={"link_status"})
+
+        assert "link_up_count      : 2" in port_info.link_status
+        assert "link_down_count    : 1" in port_info.link_status
+
+    def test_optical_all_commands_fail_uses_realistic_stub_mode(self, stub_mode_on):
+        """Optical stub output should keep 8 lanes and visible placeholder identity."""
+        optical_fields = [
+            "optical_sn", "optical_vendor", "optical_state",
+            "optical_type", "optical_type_name", "interface_code",
+            "lane_count", "tx_los_flag", "rx_los_flag",
+            "tx_lol_flag", "rx_lol_flag", "tx_power", "rx_power",
+            "vcc", "temp", "tx_bias", "host_snr", "media_snr",
+        ]
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="optical",
+            command=["hikptool", "optical_dom"],
+            parser=lambda x: {},
+            fields=optical_fields,
+        ))
+        overlay.get_field_data_with_failures = lambda pid, cid, did=0, required_fields=None: ({}, [])
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+        )
+
+        _, optical_info = sb.get_port_data(
+            0, 0, required_fields=set(optical_fields)
+        )
+
+        assert optical_info.optical_sn == "XXXXX"
+        assert optical_info.optical_vendor == "XXXXX"
+        assert optical_info.optical_type_name == "XXXXX"
+        assert optical_info.lane_count == 8
+        assert optical_info.temp == 0
+        assert optical_info.vcc == 0
+        assert optical_info.tx_power == [0.0] * 16
+        assert optical_info.rx_power == [0.0] * 16
+        assert optical_info.tx_bias == [0.0] * 16
+        assert optical_info.host_snr == [0.0] * 16
+        assert optical_info.media_snr == [0.0] * 16
+
+    def test_unbound_required_fields_use_baseline_without_warning(self, caplog):
+        """When no enabled command is bound for requested fields, use baseline only."""
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="stat_cmd",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["cw_fec_cnt"],
+        ))
+        overlay.get_field_data_with_failures = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("irrelevant command should not run")
+        )
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+        )
+
+        with caplog.at_level("WARNING", logger="src.otpd.southbound"):
+            result = sb.get_port_data(0, 0, required_fields={"port_snrlane"})
+
+        assert result is not None
+        port_info, optical_info = result
+        assert port_info.port_snrlane == [1.0] * 4
+        assert optical_info.optical_sn == "BASELINE-SN"
+        assert "Bound overlay commands returned no data" not in caplog.text
+
+    def test_no_commands_uses_baseline(self):
+        """When overlay has no registered commands, baseline is used."""
+        overlay = CommandBasedSouthbound()
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+            calculators=[calculate_derived_fields],
+        )
+
+        result = sb.get_port_data(0, 0)
+        assert result is not None
+        port_info, optical_info = result
+        assert port_info.port_snrlane == [1.0] * 4
+        assert port_info.cw_fec_cnt == 10
+        assert optical_info.optical_sn == "BASELINE-SN"
+
+    def test_missing_cw_total_inputs_warns_and_sets_zero(self, caplog):
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="dummy",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["cw_fec_cnt", "cw_uncorrect_cnt"],
+        ))
+        overlay.get_field_data_with_failures = lambda port_id, chip_id, die_id=0, required_fields=None: (
+            {"cw_fec_cnt": 20, "cw_uncorrect_cnt": 2}, []
+        )
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+            calculators=[calculate_derived_fields],
+        )
+
+        with caplog.at_level("WARNING", logger="src.otpd.field_calculators"):
+            port_info, _ = sb.get_port_data(0, 0, use_cache=False)
+
+        assert port_info.cw_fec_cnt == 20
+        assert port_info.cw_uncorrect_cnt == 2
+        assert port_info.cw_total_cnt == 0
+        assert "Cannot calculate cw_total_cnt" in caplog.text
+
+    def test_port_snr_query_does_not_calculate_cw_total_cnt(self, caplog):
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="dummy",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["port_snrlane"],
+        ))
+        overlay.get_field_data_with_failures = lambda port_id, chip_id, die_id=0, required_fields=None: (
+            {"port_snrlane": [446400.0, 502272.0, 497072.0, 490304.0]}, []
+        )
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+            calculators=[calculate_derived_fields],
+        )
+
+        with caplog.at_level("WARNING", logger="src.otpd.field_calculators"):
+            port_info, _ = sb.get_port_data(
+                0, 0, use_cache=False, required_fields={"port_snrlane"}
+            )
+
+        assert port_info.port_snrlane == [446400.0, 502272.0, 497072.0, 490304.0]
+        assert "Cannot calculate cw_total_cnt" not in caplog.text
+
+    def test_cache_key_includes_required_fields(self):
+        """Field-filtered cached queries must not reuse each other's data."""
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="snr_cmd",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["port_snrlane"],
+        ))
+        overlay.register_command(CommandEntry(
+            name="link_cmd",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["link_status"],
+        ))
+
+        def get_field_data_with_failures(port_id, chip_id, die_id=0, required_fields=None):
+            if required_fields == {"port_snrlane"}:
+                return {"port_snrlane": [9.0] * 4}, []
+            if required_fields == {"link_status"}:
+                return {"link_status": "LINK UP"}, []
+            return {}, []
+
+        overlay.get_field_data_with_failures = get_field_data_with_failures
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+        )
+
+        snr_port_info, _ = sb.get_port_data(0, 0, required_fields={"port_snrlane"})
+        link_port_info, _ = sb.get_port_data(0, 0, required_fields={"link_status"})
+
+        assert snr_port_info.port_snrlane == [9.0] * 4
+        assert snr_port_info.link_status == ""
+        assert link_port_info.port_snrlane == [1.0] * 4
+        assert link_port_info.link_status == "LINK UP"
+
+    def test_use_cache_false_recalculates_cw_total_from_current_port_info_echo(self):
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="dummy",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["sds_rate_bps", "tx_lane_num", "cw_fec_cnt", "cw_uncorrect_cnt"],
+        ))
+        overlay_values = [
+            (
+                {
+                    "sds_rate_bps": 1000,
+                    "tx_lane_num": 4,
+                    "cw_fec_cnt": 20,
+                    "cw_uncorrect_cnt": 2,
+                },
+                [],
+            ),
+            (
+                {
+                    "sds_rate_bps": 2000,
+                    "tx_lane_num": 8,
+                    "cw_fec_cnt": 30,
+                    "cw_uncorrect_cnt": 3,
+                },
+                [],
+            ),
+        ]
+
+        def get_field_data_with_failures(port_id, chip_id, die_id=0, required_fields=None):
+            return overlay_values.pop(0)
+
+        overlay.get_field_data_with_failures = get_field_data_with_failures
+
+        sb = CompositeSouthbound(
+            baseline=self._BaselineSouthbound(),
+            overlay=overlay,
+            calculators=[make_derived_fields_calculator(collection_window=2.0)],
+        )
+
+        first_port_info, _ = sb.get_port_data(0, 0, use_cache=False)
+        second_port_info, _ = sb.get_port_data(0, 0, use_cache=False)
+
+        assert first_port_info.cw_fec_cnt == 20
+        assert first_port_info.cw_uncorrect_cnt == 2
+        assert first_port_info.cw_total_cnt == 8000
+        assert second_port_info.cw_fec_cnt == 30
+        assert second_port_info.cw_uncorrect_cnt == 3
+        assert second_port_info.cw_total_cnt == 32000
+
+
+class TestNoBaselineLeakage:
+    """Comprehensive tests: command-covered fields must never show baseline values."""
+
+    def setup_method(self):
+        CompositeSouthbound._data_cache.clear()
+
+    # Baseline returns distinctive non-zero values so leaks are detectable.
+    class _NonZeroBaseline(SouthboundInterface):
+        def get_port_data(self, port_id, chip_id, die_id=0, use_cache=True):
+            return (
+                PortInfo(
+                    port_id=port_id,
+                    chip_id=chip_id,
+                    port_snrlane=[25.0] * 4,
+                    cw_fec_cnt=999,
+                    cw_uncorrect_cnt=888,
+                    cw_total_cnt=1999,
+                ),
+                OpticalModuleInfo(
+                    port_id=port_id,
+                    chip_id=chip_id,
+                    optical_sn="BASELINE-SN",
+                    optical_vendor="BASELINE-VENDOR",
+                    temp=99,
+                    vcc=9999,
+                    tx_power=[1.1] * 16,
+                    rx_power=[2.2] * 16,
+                    tx_bias=[3.3] * 16,
+                    host_snr=[4.4] * 16,
+                    media_snr=[5.5] * 16,
+                    interface_code=3,
+                ),
+            )
+
+    def test_command_succeeds_real_data_overrides_baseline(self):
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="stat_cmd",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["cw_fec_cnt", "cw_uncorrect_cnt"],
+        ))
+        overlay.get_field_data_with_failures = lambda pid, cid, did=0, required_fields=None: (
+            {"cw_fec_cnt": 42, "cw_uncorrect_cnt": 7}, []
+        )
+
+        sb = CompositeSouthbound(
+            baseline=self._NonZeroBaseline(),
+            overlay=overlay,
+        )
+        port_info, _ = sb.get_port_data(0, 0)
+
+        assert port_info.cw_fec_cnt == 42       # real, not 999
+        assert port_info.cw_uncorrect_cnt == 7   # real, not 888
+        assert port_info.port_snrlane == [25.0] * 4  # baseline OK
+
+    def test_command_empty_result_returns_none_production_mode(self, stub_mode_off):
+        overlay = CommandBasedSouthbound()
+        failed_entry = CommandEntry(
+            name="stat_cmd",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["cw_fec_cnt", "cw_uncorrect_cnt"],
+        )
+        overlay.register_command(failed_entry)
+        overlay.get_field_data_with_failures = lambda pid, cid, did=0, required_fields=None: (
+            {}, [failed_entry]
+        )
+
+        sb = CompositeSouthbound(
+            baseline=self._NonZeroBaseline(),
+            overlay=overlay,
+        )
+        result = sb.get_port_data(0, 0)
+        assert result is None
+
+    def test_command_not_found_raises_production_mode(self, stub_mode_off):
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="stat_cmd",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["cw_fec_cnt", "cw_uncorrect_cnt"],
+        ))
+        overlay.get_field_data_with_failures = lambda pid, cid, did=0, required_fields=None: (_ for _ in ()).throw(
+            FileNotFoundError("ubctl not found")
+        )
+
+        sb = CompositeSouthbound(
+            baseline=self._NonZeroBaseline(),
+            overlay=overlay,
+        )
+
+        with pytest.raises(FileNotFoundError):
+            sb.get_port_data(0, 0)
+
+    def test_no_commands_all_baseline(self):
+        overlay = CommandBasedSouthbound()
+
+        sb = CompositeSouthbound(
+            baseline=self._NonZeroBaseline(),
+            overlay=overlay,
+        )
+        port_info, optical_info = sb.get_port_data(0, 0)
+
+        assert port_info.cw_fec_cnt == 999
+        assert port_info.cw_uncorrect_cnt == 888
+        assert optical_info.optical_sn == "BASELINE-SN"
+
+    def test_optical_command_all_fail_returns_none_production_mode(self, stub_mode_off):
+        overlay = CommandBasedSouthbound()
+        failed_entry = CommandEntry(
+            name="optical_cmd",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["temp", "vcc"],
+        )
+        overlay.register_command(failed_entry)
+        overlay.get_field_data_with_failures = lambda pid, cid, did=0, required_fields=None: (
+            {}, [failed_entry]
+        )
+
+        sb = CompositeSouthbound(
+            baseline=self._NonZeroBaseline(),
+            overlay=overlay,
+        )
+        result = sb.get_port_data(0, 0)
+        assert result is None
+
+    def test_mixed_command_success_and_failure(self, caplog, stub_mode_off):
+        optical_entry = CommandEntry(
+            name="optical_cmd",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["temp", "vcc"],
+        )
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(CommandEntry(
+            name="fec_cmd",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["cw_fec_cnt", "cw_uncorrect_cnt"],
+        ))
+        overlay.register_command(optical_entry)
+        overlay.get_field_data_with_failures = lambda pid, cid, did=0, required_fields=None: (
+            {"cw_fec_cnt": 50, "cw_uncorrect_cnt": 3}, [optical_entry]
+        )
+
+        sb = CompositeSouthbound(
+            baseline=self._NonZeroBaseline(),
+            overlay=overlay,
+        )
+        with caplog.at_level("WARNING", logger="src.otpd.southbound"):
+            port_info, optical_info = sb.get_port_data(0, 0)
+
+        assert port_info.cw_fec_cnt == 50       # real from fec_cmd
+        assert port_info.cw_uncorrect_cnt == 3   # real from fec_cmd
+        assert port_info.port_snrlane == [25.0] * 4  # baseline
+        assert optical_info.temp == 0            # zero, NOT 99
+        assert optical_info.vcc == 0             # zero, NOT 9999
+        assert "Southbound fields missing" in caplog.text
+        assert "southbound_command='optical_cmd'" in caplog.text
+        assert "missing_fields=['temp', 'vcc']" in caplog.text
+
+    def test_baseline_values_never_leak_into_command_fields(self, stub_mode_off):
+        baseline_cw_fec = 999
+        baseline_cw_uncorrect = 888
+
+        stat_entry = CommandEntry(
+            name="stat_cmd",
+            command=["echo"],
+            parser=lambda x: {},
+            fields=["cw_fec_cnt", "cw_uncorrect_cnt"],
+        )
+        overlay = CommandBasedSouthbound()
+        overlay.register_command(stat_entry)
+
+        # Production mode: all commands failed -> returns None
+        overlay.get_field_data_with_failures = lambda pid, cid, did=0, required_fields=None: (
+            {}, [stat_entry]
+        )
+        sb = CompositeSouthbound(
+            baseline=self._NonZeroBaseline(),
+            overlay=overlay,
+        )
+        result = sb.get_port_data(0, 0, use_cache=False)
+        assert result is None
+
+        # Test with partial result (some fields present, some zeroed)
+        CompositeSouthbound._data_cache.clear()
+        overlay.get_field_data_with_failures = lambda pid, cid, did=0, required_fields=None: (
+            {"cw_fec_cnt": 0}, [stat_entry]
+        )
+        port_info, _ = sb.get_port_data(0, 0, use_cache=False)
+        assert port_info.cw_fec_cnt != baseline_cw_fec
+        assert port_info.cw_uncorrect_cnt != baseline_cw_uncorrect
+        assert port_info.cw_fec_cnt == 0
+        assert port_info.cw_uncorrect_cnt == 0
+
+
+class TestFactory:
+    """Test get_southbound_interface factory function."""
+
+    def test_command_source(self):
+        sb = get_southbound_interface("command", default_timeout=5.0)
+        assert isinstance(sb, CommandBasedSouthbound)
+
+    def test_hybrid_source(self):
+        sb = get_southbound_interface("hybrid")
+        assert isinstance(sb, CompositeSouthbound)
+
+    def test_unknown_source_raises(self):
+        with pytest.raises(ValueError, match="Unknown source"):
+            get_southbound_interface("nonexistent")
+
+
+class TestStubMode:
+    """Test debug-gated stub mode environment variables."""
+
+    def test_default_is_production_mode(self, stub_mode_off):
+        assert is_debug_mode() is False
+        assert is_stub_mode() is False
+
+    def test_delivery_mode_ignores_stub_environment(self, stub_mode_off):
+        os.environ["OTPD_STUB_MODE"] = "1"
+
+        assert is_debug_mode() is False
+        assert is_stub_mode() is False
+
+    def test_stub_mode_enabled_with_1(self, stub_mode_on):
+        assert is_debug_mode() is True
+        assert is_stub_mode() is True
+
+    def test_stub_mode_enabled_with_true(self, debug_mode_on):
+        old = os.environ.get("OTPD_STUB_MODE")
+        os.environ["OTPD_STUB_MODE"] = "true"
+        try:
+            assert is_stub_mode() is True
+        finally:
+            if old is not None:
+                os.environ["OTPD_STUB_MODE"] = old
+            else:
+                os.environ.pop("OTPD_STUB_MODE", None)
+
+    def test_stub_mode_enabled_with_yes(self, debug_mode_on):
+        old = os.environ.get("OTPD_STUB_MODE")
+        os.environ["OTPD_STUB_MODE"] = "yes"
+        try:
+            assert is_stub_mode() is True
+        finally:
+            if old is not None:
+                os.environ["OTPD_STUB_MODE"] = old
+            else:
+                os.environ.pop("OTPD_STUB_MODE", None)
+
+    def test_stub_mode_disabled_with_0(self, debug_mode_on):
+        old = os.environ.get("OTPD_STUB_MODE")
+        os.environ["OTPD_STUB_MODE"] = "0"
+        try:
+            assert is_stub_mode() is False
+        finally:
+            if old is not None:
+                os.environ["OTPD_STUB_MODE"] = old
+            else:
+                os.environ.pop("OTPD_STUB_MODE", None)
+
+    def test_stub_mode_case_insensitive(self, debug_mode_on):
+        old = os.environ.get("OTPD_STUB_MODE")
+        os.environ["OTPD_STUB_MODE"] = "TRUE"
+        try:
+            assert is_stub_mode() is True
+        finally:
+            if old is not None:
+                os.environ["OTPD_STUB_MODE"] = old
+            else:
+                os.environ.pop("OTPD_STUB_MODE", None)
