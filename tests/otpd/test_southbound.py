@@ -670,6 +670,24 @@ class TestStatCommandParsers:
         result = parse_link_status(stdout)
         assert result == {"link_status": stdout}
 
+    def test_parse_link_status_normalizes_link_tokens(self):
+        stdout = (
+            "link status info:\n"
+            "link_up_count      : 2\n"
+            "link_down_count    : 1\n"
+            "records:\n"
+            "  Mon Oct 23 10:30:15 2023  LINK_UP\n"
+            "  Mon Oct 23 10:25:10 2023  LINK_DOWN\n"
+        )
+        result = parse_link_status(stdout)
+        assert "LINK UP" in result["link_status"]
+        assert "LINK DOWN" in result["link_status"]
+        assert "LINK_UP" not in result["link_status"]
+        assert "LINK_DOWN" not in result["link_status"]
+        # 字段标签下划线不被破坏
+        assert "link_up_count" in result["link_status"]
+        assert "link_down_count" in result["link_status"]
+
     def test_parse_link_status_empty(self):
         result = parse_link_status("")
         assert result == {"link_status": ""}

@@ -342,5 +342,12 @@ def parse_optical_dom(stdout: str) -> Dict[str, Any]:
 
 
 def parse_link_status(stdout: str) -> Dict[str, Any]:
-    """Parse ubctl port_link output and return raw stdout as-is."""
-    return {"link_status": stdout}
+    """Parse ubctl port_link output.
+
+    Normalize the status tokens LINK_UP / LINK_DOWN (the raw device output
+    uses underscores) to LINK UP / LINK DOWN so they read like the rest of
+    the report. Only these two tokens are rewritten; field labels such as
+    link_up_count / link_down_count keep their underscores.
+    """
+    normalized = stdout.replace("LINK_UP", "LINK UP").replace("LINK_DOWN", "LINK DOWN")
+    return {"link_status": normalized}
