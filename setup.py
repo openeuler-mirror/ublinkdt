@@ -47,7 +47,7 @@ _consume_debug_build_flag()
 
 setup(
     name='ublinkdt',
-    version='1.0.0',
+    version='1.0.1',
     description='UBLink-DT (Unified Bus Link Diagnostic Tool)',
     author='liusiyu60@huawei.com',
     package_dir={"ublinkdt": "src"},

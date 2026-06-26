@@ -30,8 +30,8 @@ ublinkdt -m otpd -p 0 -c 0 -d 0 --link-stat
 
 | 场景 | 命令 | 说明 |
 | --- | --- | --- |
-| 交付/运行 | `python -m pip install -e .` | 不安装测试依赖；依赖`ubctl`、`hikptool` |
-| 构建 wheel | `python -m pip install -r requirements.txt` | 只安装 `build`、`setuptools`、`wheel` |
+| 交付/运行 | `python -m pip install -e .` | 不安装测试依赖；依赖 `ubctl`、`hikptool` |
+| 构建 wheel | 见[根 README](../../README.md)「构建 Wheel」 | 只安装 `build`、`setuptools`、`wheel` |
 | Debug 运行 | 见“Debug 桩模式” | 构建并安装会响应 `OTPD_STUB_MODE` 的 Debug wheel |
 
 设备侧查询依赖目标环境提供对应系统命令：
@@ -44,38 +44,14 @@ ublinkdt -m otpd -p 0 -c 0 -d 0 --link-stat
 | `--link-stat` | `ubctl -m port_link` |
 | `--ip --inet6` | Linux `ip -6 addr show`；Windows `ipconfig` / PowerShell |
 
-## 构建 Wheel
-
-构建交付 wheel：
-
-```bash
-python -m pip install -r requirements.txt
-python -m build --wheel --no-isolation
-python -m pip install dist/ublinkdt-1.0.0-py3-none-any.whl
-```
-
-构建 Debug wheel：
-
-```bash
-python -m pip install -r requirements.txt
-python -m build --wheel --no-isolation -C--build-option=--debug-build
-python -m pip install dist/ublinkdt-1.0.0-py3-none-any.whl
-```
-
-Debug wheel 会在构建产物中写入 Debug 标记。交付 wheel 会忽略 `OTPD_STUB_MODE`。
-
-默认 `python -m build` 会创建隔离构建环境，并在该环境中安装构建依赖。内网或离线环境推荐使用上面的 `--no-isolation`，让构建过程复用当前环境中已经安装好的 `requirements.txt`。
-
 ## Debug 桩模式
 
 > 此模式仅用于集成联调，不得在生产环境中启用。
 
-Debug 桩模式需要先构建并安装 Debug wheel，再设置 `OTPD_STUB_MODE=1`。普通源码运行或 `python -m pip install -e .` 安装仍是交付模式，即使设置 `OTPD_STUB_MODE=1` 也会继续执行真实南向命令。
+Debug 桩模式需要先构建并安装 Debug wheel（构建步骤见[根 README](../../README.md) 的「构建 Wheel」一节），再设置 `OTPD_STUB_MODE=1`。普通源码运行或 `python -m pip install -e .` 安装仍是交付模式，即使设置 `OTPD_STUB_MODE=1` 也会继续执行真实南向命令。
 
 ```bash
-python -m pip install -r requirements.txt
-python -m build --wheel --no-isolation -C--build-option=--debug-build
-python -m pip install --force-reinstall dist/ublinkdt-1.0.0-py3-none-any.whl
+python -m pip install --force-reinstall dist/ublinkdt-{version}-py3-none-any.whl
 OTPD_STUB_MODE=1 ublinkdt -m otpd -p 0 -c 0 -d 0 --stat
 ```
 
@@ -96,7 +72,7 @@ OTPD_STUB_MODE=1 ublinkdt -m otpd -p 0 -c 0 -d 0 --stat
 | `--port-snr` | 已接入 | `hikptool serdes_info -i {chip_id} -s m{port_id+10}d0 -n 4 -k` | 固定输出 4 个 port SNR lane |
 | `--stat` | 已逐步接入 | `ubctl -m port_info`、`ubctl -m dl -f bit_err` | 解析纠前误码数、不可纠误码数等指标 |
 | `--optical` | 已逐步接入 | `hikptool optical_dom` | 解析 SN、厂商、温度、电压、功率、偏置电流、Host/Media SNR、失锁标志 等字段 |
-| `--link-stat` | 已逐步接入 | `ubctl -m port_link` | 解析建链、断链记录 |
+| `--link-stat` | 已逐步接入 | `ubctl -m port_link` | 解析建链、断链记录（回显 `LINK_UP`/`LINK_DOWN` 规范化为空格） |
 | `--ip --inet6` | 已接入系统命令 | 过滤无用地址后返回第一条 IPv6 地址 |
 
 数据缺失规则：
@@ -144,7 +120,9 @@ graph TB
 | `src/otpd/command_parsers.py` | 南向命令文本回显解析 |
 | `src/otpd/field_calculators.py` | `cw_total_cnt` 等派生字段计算 |
 | `src/otpd/system_interface.py` | `RealSystemInterface`，跨平台 IP 查询 |
+| `src/otpd/runtime.py` | 运行模式策略（debug/stub 判定）与南向诊断查询上下文 |
 | `src/otpd/models.py` | `PortInfo`、`OpticalModuleInfo` 数据模型 |
+| `src/otpd/schema.py` | 数据形状常量：`PORT_SNR_LANE_COUNT`、`OPTICAL_LANE_COUNT`、字段名集合、光模块类型映射 |
 | `src/otpd/format.py` | CLI 输出格式化；按 `lane_count` 显示逐 lane 明细 |
 
 ## 南向命令开发
